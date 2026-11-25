@@ -202,10 +202,10 @@ async fn recover_fallback_error<T: Transport<RoleClient> + 'static>(
         return error;
     }
     if transport.supports_quit_status() && transport.quit_status().is_none() {
-        // Initialization has already failed; preserve its error rather than any
-        // cleanup error. WorkerTransport::close awaits the worker task, which
-        // orders this read after its terminal-status publication.
-        let _ = transport.close().await;
+        // The request queue can close just before the worker publishes its cause.
+        // Allow a short grace period for publication, not a second startup timeout.
+        const QUIT_STATUS_GRACE: Duration = Duration::from_millis(100);
+        let _ = tokio::time::timeout(QUIT_STATUS_GRACE, transport.close()).await;
     }
     match (error, transport.quit_status()) {
         (ClientInitializeError::TransportError { context, .. }, Some(cause)) => {
@@ -2805,12 +2805,19 @@ mod tests {
     }
 
     #[cfg(feature = "transport-worker")]
-    #[tokio::test]
-    async fn auto_fallback_send_recovers_retained_startup_cause() {
+    #[rstest::rstest]
+    #[case::publishes_status(false, std::io::ErrorKind::ConnectionRefused)]
+    #[case::stalled_close(true, std::io::ErrorKind::BrokenPipe)]
+    #[tokio::test(start_paused = true)]
+    async fn auto_fallback_send_recovers_retained_startup_cause(
+        #[case] stall_close: bool,
+        #[case] expected: std::io::ErrorKind,
+    ) {
         use crate::transport::worker::{RetainedQuitReason, WorkerQuitReason};
 
         struct FallbackFailureTransport {
             sends: Arc<std::sync::atomic::AtomicUsize>,
+            stall_close: bool,
             closed: bool,
         }
 
@@ -2842,6 +2849,9 @@ mod tests {
             }
 
             async fn close(&mut self) -> Result<(), Self::Error> {
+                if self.stall_close {
+                    return std::future::pending().await;
+                }
                 self.closed = true;
                 Ok(())
             }
@@ -2874,10 +2884,11 @@ mod tests {
             }
         }
 
-        let error = serve_client_with_ct_inner(
+        let startup = serve_client_with_ct_inner(
             (),
             FallbackFailureTransport {
                 sends: Arc::default(),
+                stall_close,
                 closed: false,
             },
             ClientLifecycleMode::Auto {
@@ -2886,9 +2897,11 @@ mod tests {
             },
             CancellationToken::new(),
             Duration::from_millis(1),
-        )
-        .await
-        .expect_err("fallback send must fail");
+        );
+        let error = tokio::time::timeout(Duration::from_secs(1), startup)
+            .await
+            .expect("report the startup error even if close never finishes")
+            .expect_err("fallback send must fail");
         match error {
             ClientInitializeError::TransportError { error, context } => {
                 assert_eq!(context.as_ref(), "send initialize request");
@@ -2896,8 +2909,8 @@ mod tests {
                 // quit-reason wrapper, not just when the bare error is boxed.
                 let cause = error
                     .downcast_ref::<FallbackFailureTransport, RoleClient>()
-                    .expect("retained typed cause through the shared quit reason");
-                assert_eq!(cause.kind(), std::io::ErrorKind::ConnectionRefused);
+                    .expect("typed cause from the retained status or original send error");
+                assert_eq!(cause.kind(), expected);
             }
             other => panic!("expected retained transport cause, got {other:?}"),
         }
