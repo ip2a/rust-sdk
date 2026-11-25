@@ -412,6 +412,9 @@ impl DynamicTransportError {
         None
     }
 
+    /// Returns whether [`downcast`](Self::downcast) can recover an owned `T::Error`.
+    /// A retained quit reason returns `false` even if it contains a `T::Error`;
+    /// use [`downcast_ref`](Self::downcast_ref) to inspect either delivery path.
     pub fn is<T: Transport<R> + 'static, R: ServiceRole>(&self) -> bool {
         self.error.is::<T::Error>() && self.transport_type_id == std::any::TypeId::of::<T>()
     }
